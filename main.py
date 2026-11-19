@@ -13,27 +13,30 @@ Model (standard library only, deterministic, CPU only):
     With no refresh ever observed (a flat launch-night history), fall back to
     a launch-wave prior calibrated on the kit's own facts: Exophase's first
     refresh multiplied the tracked players ~6x over ~4.7h.
-  - EARNERS E_i(t): a common-hazard model, dE_i/dt = h_i(t) * (P - E_i).
-    Between refreshes the constant hazard that maps the interval's start
-    state to its end state (with P linear in the interval) is recovered by
-    bisection; each trophy's level is its recent hazard (smoothed over its
-    last intervals) and the pooled log-slope of h over log-time across
-    trophies is extrapolated forward.  E_i is then integrated to the target
-    on 0.25h substeps against the extrapolated P(t).  Because the hazard
-    acts on the whole tracked pool -- old cohort progressing AND new
-    joiners -- the model keeps growing earners even when the player base
-    stops growing (dilution alone would freeze the rate), and it grows
-    them faster than log-linear when the cohort reaches a trophy's
-    difficulty window.  With no refresh observed, the fallback is a
-    marginal-cohort prior: m_i = 1 - (1 - r_i)^rho, where r_i is the
-    regular cohort's rate after subtracting the reviewer core (the mode of
-    the small earner counts), rho ~ 0.22 for launch night.
+  - EARNERS E_i(t) -- HYBRID median (round 2).  Once the history holds two
+    or more refresh points, the median comes from a COHORT-DELAY model:
+    every player earns trophy i a lognormal delay after they start playing
+    (median tau_i hours, shared log-spread 0.4), so E_i(t) is the sum over
+    start cohorts of cohort size times the delay CDF at that cohort's lag.
+    tau_i is fitted per trophy by matching the model's earner count to the
+    observed count at the last refresh.  This fixes the round-1 hazard
+    model's structural failure on slow trophies: a trophy nobody has earned
+    yet has hazard ~0, so the hazard ODE leaves it at ~0 forever, while in
+    truth the launch cohort reaches its delay window over the forecast
+    horizon and the trophy rises sharply.  With a FLAT history (one refresh
+    point) the delay fit is unidentified -- it rests entirely on the assumed
+    anchor start distribution and reviewer count -- so the median stays
+    with the round-1 models: the common-hazard ODE (once refreshes exist)
+    and the marginal-cohort prior (rho = 0.08) when none do.
   - The answer is the page as of Exophase's last refresh before the target, so
     the median is the post-refresh state E_i(T)/P(T), never the frozen last
-    rate.  The spread is refresh-aware: it grows with the size of the
-    predicted move, the horizon, the sparsity of the history, and the Poisson
-    noise on small earner counts, so the 90% band covers a refresh that lands
-    early, late, or not at all.
+    rate.  The spread is refresh-aware and HORIZON-DEPENDENT (round 2): it
+    grows with the size of the predicted move, the horizon, the sparsity of
+    the history, and the Poisson noise on small earner counts, and the whole
+    spread is scaled by 0.5 at a 90-minute horizon rising to 0.8 at a
+    4.5-day horizon -- the practice answers are nearly deterministic once
+    the refresh is modelled, so a full-width interval wastes pinball loss,
+    while the week-one answer is genuinely uncertain.
   - Quantiles are a logit-normal around the median; the opening trophy (100%
     in the last read) keeps a median near 100 with a widened lower tail.
 
@@ -57,7 +60,9 @@ LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95]
 Z = [-1.645, -0.674, 0.0, 0.674, 1.645]
 
 # --- tunable model constants (see module docstring) ---
-RHO = 0.22            # flat-history time-scaling exponent for marginal rates
+RHO = 0.08            # flat-history time-scaling exponent for marginal rates
+                      # (round 2: 0.05-0.10 plateau on the simulator; 0.22
+                      # over-credited new joiners with earning over 90 min)
 PRIOR_G = 2.71        # flat-history log-time player-growth slope
 PRIOR_TAU_H = 5.0     # flat-history log-time player-growth timescale (hours)
 PRIOR_MULT_CAP = 8.0  # cap on the flat-history player multiplier
@@ -69,6 +74,16 @@ S_COUNT_CAP = 0.6     # cap on the Poisson count-noise spread
 S_MIN = 0.3
 S_MAX = 1.5
 S_NEAR100 = 1.2       # spread for a trophy whose median is >= 99.9%
+# round 2: cohort-delay median (multi-refresh histories only)
+DELAY_SIGMA = 0.4     # log-spread of the hours-to-earn distribution
+DELAY_TAU_LO = 0.05   # bisection bounds on the fitted median delay (hours)
+DELAY_TAU_HI = 2000.0
+DELAY_ANCHOR_H = 12.83  # release -> first read (RULES.txt: 11:00 -> 23:50:49Z)
+DELAY_REVIEWER_H = 500.0  # reviewers started this many hours before release
+# round 2: horizon-dependent spread multiplier (0.5 at 90 min -> 0.8 at 4.5 d)
+K_SPREAD_SHORT = 0.5
+K_SPREAD_LONG = 0.8
+K_SPREAD_TAU_D = 1.0  # days; multiplier = short + (long-short)*(1-exp(-d/tau))
 
 
 def clamp(x, lo=0.01, hi=99.99):
@@ -298,6 +313,78 @@ def hazard_rates(times, players, earners):
     return levels, slope
 
 
+def phi(x):
+    """Standard normal CDF."""
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+
+def delay_cohorts(times, players, grid_t, grid_p, n_rev):
+    """Cohorts (start time, size) for the delay model.
+
+    Times are hours since the first read.  The first read is DELAY_ANCHOR_H
+    after release, so the anchor cohort started uniformly on
+    [-DELAY_ANCHOR_H, 0]; it is split into 13 one-hour sub-cohorts.  Each
+    later refresh interval's joiners start at the interval midpoint; the
+    forecast grid's joiners likewise.  Reviewers (n_rev players) started
+    DELAY_REVIEWER_H before release.
+    """
+    cohorts = []
+    anchor = players[0]
+    sub = anchor / 13.0
+    for j in range(13):
+        cohorts.append((-DELAY_ANCHOR_H + j + 0.5, sub))
+    for j in range(len(times) - 1):
+        dp = players[j + 1] - players[j]
+        if dp > 0:
+            cohorts.append(((times[j] + times[j + 1]) / 2.0, float(dp)))
+    for j in range(len(grid_t) - 1):
+        dp = grid_p[j + 1] - grid_p[j]
+        if dp > 0:
+            cohorts.append(((grid_t[j] + grid_t[j + 1]) / 2.0, float(dp)))
+    if n_rev > 0:
+        cohorts.append((-(DELAY_ANCHOR_H + DELAY_REVIEWER_H), float(n_rev)))
+    return cohorts
+
+
+def earners_at(cohorts, t, tau, sigma=DELAY_SIGMA):
+    """Expected earners by time t for a trophy with lognormal delay
+    (median tau hours, log-spread sigma) over the given cohorts."""
+    if tau <= 0:
+        return sum(n for _, n in cohorts)
+    lt = math.log(tau)
+    tot = 0.0
+    for s, n in cohorts:
+        lag = t - s
+        if lag <= 0:
+            continue
+        tot += n * phi((math.log(lag) - lt) / sigma)
+    return tot
+
+
+def fit_tau(cohorts, t_last, e_target):
+    """Median hours-to-earn tau whose cohort-delay model reproduces
+    e_target earners at t_last (bisection on log tau; earners decrease in
+    tau).  The target is the FULL observed count: the reviewer cohort is
+    part of the cohort list, so it must not be subtracted from the target.
+    e_target <= 0 is unidentified (no earner seen yet): return the lower
+    bound tau that would produce ~1 earner, i.e. the smallest delay still
+    consistent with (almost) nobody having earned it."""
+    if e_target <= 0:
+        e_target = 1.0
+    lo, hi = math.log(DELAY_TAU_LO), math.log(DELAY_TAU_HI)
+    if earners_at(cohorts, t_last, math.exp(lo)) <= e_target:
+        return math.exp(lo)
+    if earners_at(cohorts, t_last, math.exp(hi)) >= e_target:
+        return math.exp(hi)
+    for _ in range(60):
+        mid = (lo + hi) / 2.0
+        if earners_at(cohorts, t_last, math.exp(mid)) > e_target:
+            lo = mid
+        else:
+            hi = mid
+    return math.exp((lo + hi) / 2.0)
+
+
 def marginal_rates(times, players, earners):
     """Per-trophy marginal cohort earn rates between refreshes.
 
@@ -425,12 +512,33 @@ def forecast_case(case):
                 e_t += h * max(pm - e_t, 0.0) * dt
         return clamp(100.0 * e_t / p_target) if p_target > 0 else last_rates[i], e_t
 
+    # --- cohort-delay median (round 2; multi-refresh histories only) ---
+    # tau_i is fitted per trophy to the FULL observed earner count at the
+    # last refresh.  The reviewer count is the mode of the small earner
+    # counts at the anchor segment (the deep-progress players who earned
+    # the hard trophies before launch).
+    delay_meds = None
+    if k >= 2:
+        from collections import Counter as _Counter
+        _counts = _Counter(earners[i][0] for i in range(n_tr)
+                           if 0 < earners[i][0] < 15)
+        n_rev_d = _counts.most_common(1)[0][0] if _counts else 0
+        _cohorts = delay_cohorts(times, players, grid_t, grid_p, n_rev_d)
+        delay_meds = []
+        for i in range(n_tr):
+            tau_i = fit_tau(_cohorts, t_last, float(earners[i][-1]))
+            e_t = earners_at(_cohorts, t_target, tau_i)
+            delay_meds.append((clamp(100.0 * e_t / p_target) if p_target > 0
+                               else last_rates[i], e_t))
+
     rows = []
     for i, trophy in enumerate(case["trophies"]):
         r_last = last_rates[i]
         e_last = earners[i][-1]
         if flat:
             r_med, e_t = median_marg(i)
+        elif delay_meds is not None:
+            r_med, e_t = delay_meds[i]
         else:
             r_med, e_t = median_haz(i)
         # spread (logit units)
@@ -442,6 +550,15 @@ def forecast_case(case):
         s_count = min(s_count, S_COUNT_CAP)
         s = math.sqrt(s_walk ** 2 + s_move ** 2 + s_sparse ** 2 + s_count ** 2)
         s = min(max(s, S_MIN), S_MAX)
+        # horizon-dependent multiplier (round 2): the practice answer is
+        # nearly deterministic once the refresh is modelled, so a
+        # full-width interval wastes pinball loss; the week-one answer is
+        # genuinely uncertain, so the multiplier rises toward K_SPREAD_LONG
+        # instead of collapsing to the simulator optimum (~0.5), which
+        # would trust the delay median more than the real data warrants.
+        _m = (K_SPREAD_SHORT + (K_SPREAD_LONG - K_SPREAD_SHORT)
+              * (1.0 - math.exp(-max(horizon_days, 0.0) / K_SPREAD_TAU_D)))
+        s = min(max(s * _m, 0.05), 3.0)
         if r_med >= 99.9:
             s = max(s, S_NEAR100)
         lg = logit(r_med)

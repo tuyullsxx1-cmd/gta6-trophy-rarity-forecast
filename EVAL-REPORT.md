@@ -4,9 +4,87 @@ There is no local grade for this bounty; the server grades every entry.
 This report records the local evaluation that was done instead, so the
 numbers are checkable and the limitations are stated plainly.
 
-## Final model
+## Final model (round 2)
 
-Common-hazard ODE on earners/players (`main.py`, 467 lines, stdlib only):
+Hybrid median (`main.py`, stdlib only, deterministic): once the history
+holds two or more refresh points, the median comes from a COHORT-DELAY
+model -- every player earns a trophy a lognormal delay after they start
+playing (median tau_i hours, shared log-spread 0.4); tau_i is fitted per
+trophy by matching the model's earner count to the observed count at the
+last refresh.  With a FLAT history (one refresh point) the median stays
+with the round-1 models: the common-hazard ODE (once refreshes exist) and
+the marginal-cohort prior (rho = 0.08, down from 0.22) when none do.
+Spread is horizon-dependent: the whole spread is scaled by 0.5 at a
+90-minute horizon rising to 0.8 at a 4.5-day horizon.
+
+## Round 2 changes (19 Nov 2026, evening) -- what changed and why
+
+Round 1 scored 0.181542 on the real practice cases (rank 531 of 3,224),
+typical miss 0.04 pp, coverage 0.9818.  Diagnosis (simulator + the live
+numbers): the median is close but the intervals are far too wide, and on
+the long-horizon final case the round-1 median fails structurally on slow
+trophies (simulator f00: median logit bias +2.5 to +3.0 on the eight
+slowest trophies -- a trophy nobody has earned yet has hazard ~0, so the
+hazard ODE leaves it at ~0 forever, while in truth the launch cohort
+reaches its delay window over the forecast horizon and the trophy rises
+10-14x).
+
+1. **Cohort-delay median (multi-refresh histories).** E_i(t) = sum over
+   start cohorts of cohort size x delay CDF at that cohort's lag.
+   Simulator f00: 0.7732 -> 0.2946 pinball; worst world 0.8635 -> 0.3061;
+   coverage 0.70 -> 0.89.  Robust to the tau draw (fresh random taus:
+   f00 0.296 vs hazard 0.731) and to sigma 0.3/0.5 (f00 0.42/0.40, still
+   far better than the hazard's 0.77).  A trajectory (all-refresh-points)
+   tau fit was tried and rejected: same mean, worse worst world (0.355).
+2. **Hybrid switch.** The delay fit is used only when k >= 2 refresh
+   points.  On flat histories it is unidentified (it rests on the assumed
+   anchor start distribution and reviewer count) and scores 0.49-0.61 on
+   the simulator practice vs 0.21 for the hazard/marginal median -- even
+   with the TRUE simulator parameters (n_rev, Weibull starts, sigma) it
+   scores 0.51-0.61, because the simulator's practice answers are
+   generated from random taus that contradict the real anchor counts
+   (the sim's internal earner count at the anchor is ~1.2x the displayed
+   one).  So the flat path keeps the round-1 median, which is validated
+   on the REAL practice score (0.1815).
+3. **Spread recalibration (horizon-dependent).** A spread-scale sweep
+   showed practice wants ~0.5x the round-1 width (coverage 0.98 -> 0.94)
+   while the final case wants ~0.75-0.8x (the simulator optimum is ~0.5x,
+   but that trusts the delay median more than the real data warrants, so
+   0.8x is kept as a safety margin).  Practice: 0.2121/0.2309 -> 0.1598/
+   0.2016 on the simulator.
+4. **rho 0.22 -> 0.08.** The flat-path marginal prior over-credited new
+   joiners with earning over 90 minutes; the sweep is a flat plateau at
+   0.05-0.10, so 0.08 is the plateau centre, not a knife-edge.  It does
+   not touch the final case (the flat path is never used there).
+5. **Bug found and fixed while building the delay model:** the first
+   version subtracted the reviewer count from the fit target while the
+   reviewer cohort stayed in the cohort list, so the fit used the
+   reviewers' CDF to match the target and the practice medians collapsed
+   to ~0.  The fit now targets the FULL observed count.
+
+## Simulator evaluation, round 2 (same 5 worlds, same scorer)
+
+| model | practice p00/p01 | f00 | MEAN | worst world |
+|---|---|---|---|---|
+| round 1 (hazard + marginal) | 0.2121 / 0.2309 | 0.7732 | 0.4054 | 0.4359 |
+| **round 2 (hybrid)** | **0.1598 / 0.2016** | **0.2946** | **0.2187** | **0.2244** |
+
+Coverage round 2: practice 0.94/0.92, f00 0.89.  Fresh tau draws
+(2 extra worlds, different random trophy delays): round 2 MEAN 0.222,
+f00 0.296 vs round 1 MEAN 0.393, f00 0.731 -- the improvement is not an
+artefact of one tau draw.
+
+Projected real practice score (if the round-1 real/sim ratio of 0.82
+transfers): ~0.15, vs round 1's 0.1815.  That is a real move but NOT
+toward the ~0.10 hoped for, and still far from the live top 10
+(0.024-0.061).  The final case is the scored one, and there the
+simulator says the model is ~2.6x better than round 1 -- but the
+simulator is self-built, the delay model is in its own class, and no
+local number predicts the real f00 score.  Honest assessment: round 2
+is very likely to improve both the practice board and the final run
+materially; it is not likely to reach the top 20 on practice alone.
+
+## Final model (round 1, superseded)
 refresh segmentation → local log-log power-law player curve → per-trophy
 hazard recovered by bisection per interval, pooled log-slope extrapolated
 → E integrated to the target on 0.25 h substeps → refresh-aware
