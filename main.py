@@ -30,13 +30,21 @@ Model (standard library only, deterministic, CPU only):
     and the marginal-cohort prior (rho = 0.08) when none do.
   - The answer is the page as of Exophase's last refresh before the target, so
     the median is the post-refresh state E_i(T)/P(T), never the frozen last
-    rate.  The spread is refresh-aware and HORIZON-DEPENDENT (round 2): it
-    grows with the size of the predicted move, the horizon, the sparsity of
-    the history, and the Poisson noise on small earner counts, and the whole
-    spread is scaled by 0.5 at a 90-minute horizon rising to 0.8 at a
-    4.5-day horizon -- the practice answers are nearly deterministic once
-    the refresh is modelled, so a full-width interval wastes pinball loss,
-    while the week-one answer is genuinely uncertain.
+    rate.  The spread is refresh-aware and HORIZON-DEPENDENT (round 2,
+    narrowed in round 3): it grows with the size of the predicted move, the
+    horizon, the sparsity of the history, and the Poisson noise on small
+    earner counts, and the whole spread is scaled by 0.5 at a 90-minute
+    horizon rising to 0.7 at a 4.5-day horizon (round 3: 0.7, down from 0.8
+    -- the simulator says the long-horizon intervals over-cover, and the
+    narrower width gains on every simulator family without moving the worst
+    world; the practice answers are nearly deterministic once the refresh
+    is modelled, so a full-width interval wastes pinball loss, while the
+    week-one answer is genuinely uncertain).
+  - Round 3: the delay median's tau is the geometric mean of the last-point
+    fit and the trajectory fit (see fit_tau_traj), which tames the far-tail
+    overprediction on slow trophies (platinum was +2.5 to +3.9 logit too
+    high on the simulator) while holding the saturating world at the
+    round-2 level.
   - Quantiles are a logit-normal around the median; the opening trophy (100%
     in the last read) keeps a median near 100 with a widened lower tail.
 
@@ -80,9 +88,9 @@ DELAY_TAU_LO = 0.05   # bisection bounds on the fitted median delay (hours)
 DELAY_TAU_HI = 2000.0
 DELAY_ANCHOR_H = 12.83  # release -> first read (RULES.txt: 11:00 -> 23:50:49Z)
 DELAY_REVIEWER_H = 500.0  # reviewers started this many hours before release
-# round 2: horizon-dependent spread multiplier (0.5 at 90 min -> 0.8 at 4.5 d)
+# round 3: horizon-dependent spread multiplier (0.5 at 90 min -> 0.7 at 4.5 d)
 K_SPREAD_SHORT = 0.5
-K_SPREAD_LONG = 0.8
+K_SPREAD_LONG = 0.7
 K_SPREAD_TAU_D = 1.0  # days; multiplier = short + (long-short)*(1-exp(-d/tau))
 
 
@@ -385,6 +393,42 @@ def fit_tau(cohorts, t_last, e_target):
     return math.exp((lo + hi) / 2.0)
 
 
+def fit_tau_traj(cohorts, times, e_obs):
+    """Fit tau by least squares over the whole refresh trajectory: minimize
+    sum_j (E_model(t_j; tau) - E_obs_j)^2 / max(E_obs_j, 1) over log tau.
+    Uses the trajectory shape, not just the last point, so a trophy whose
+    count stayed flat while P grew pushes tau up -- the last-point fit
+    alone leaves tau nearly unidentified for slow trophies (their count is
+    ~the reviewer count at every refresh), and its far-tail prediction is
+    exponentially sensitive to the fitted tau."""
+    lo, hi = math.log(DELAY_TAU_LO), math.log(DELAY_TAU_HI)
+
+    def loss(lt):
+        tau = math.exp(lt)
+        tot = 0.0
+        for t, e in zip(times, e_obs):
+            if e <= 0:
+                continue
+            d = earners_at(cohorts, t, tau) - e
+            tot += d * d / max(e, 1.0)
+        return tot
+
+    gr = (math.sqrt(5.0) - 1.0) / 2.0
+    a, b = lo, hi
+    c, d = b - gr * (b - a), a + gr * (b - a)
+    fc, fd = loss(c), loss(d)
+    for _ in range(50):
+        if fc < fd:
+            b, d, fd = d, c, fc
+            c = b - gr * (b - a)
+            fc = loss(c)
+        else:
+            a, c, fc = c, d, fd
+            d = a + gr * (b - a)
+            fd = loss(d)
+    return math.exp((a + b) / 2.0)
+
+
 def marginal_rates(times, players, earners):
     """Per-trophy marginal cohort earn rates between refreshes.
 
@@ -517,6 +561,16 @@ def forecast_case(case):
     # last refresh.  The reviewer count is the mode of the small earner
     # counts at the anchor segment (the deep-progress players who earned
     # the hard trophies before launch).
+    # Round 3: tau_i is the GEOMETRIC MEAN of the last-point fit and the
+    # trajectory fit (fit_tau_traj).  The last-point fit alone leaves tau
+    # nearly unidentified for slow trophies -- their count is ~the reviewer
+    # count at every refresh, so the fit lands wherever the tiny regular
+    # contribution matches, and the far-tail prediction at the target is
+    # exponentially sensitive to that tau (platinum was overpredicted by
+    # +2.5 to +3.9 logit on the simulator).  The trajectory fit uses the
+    # flat count history to push tau up; the geometric mean keeps its
+    # gain while holding the worst world at the round-2 level (the pure
+    # trajectory fit regresses the saturating world).
     delay_meds = None
     if k >= 2:
         from collections import Counter as _Counter
@@ -526,7 +580,9 @@ def forecast_case(case):
         _cohorts = delay_cohorts(times, players, grid_t, grid_p, n_rev_d)
         delay_meds = []
         for i in range(n_tr):
-            tau_i = fit_tau(_cohorts, t_last, float(earners[i][-1]))
+            _t_last = fit_tau(_cohorts, t_last, float(earners[i][-1]))
+            _t_traj = fit_tau_traj(_cohorts, times, earners[i])
+            tau_i = math.sqrt(_t_last * _t_traj)
             e_t = earners_at(_cohorts, t_target, tau_i)
             delay_meds.append((clamp(100.0 * e_t / p_target) if p_target > 0
                                else last_rates[i], e_t))

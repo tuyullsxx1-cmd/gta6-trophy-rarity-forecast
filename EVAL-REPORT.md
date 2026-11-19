@@ -4,18 +4,114 @@ There is no local grade for this bounty; the server grades every entry.
 This report records the local evaluation that was done instead, so the
 numbers are checkable and the limitations are stated plainly.
 
-## Final model (round 2)
+## Final model (round 3)
 
 Hybrid median (`main.py`, stdlib only, deterministic): once the history
 holds two or more refresh points, the median comes from a COHORT-DELAY
 model -- every player earns a trophy a lognormal delay after they start
-playing (median tau_i hours, shared log-spread 0.4); tau_i is fitted per
-trophy by matching the model's earner count to the observed count at the
-last refresh.  With a FLAT history (one refresh point) the median stays
-with the round-1 models: the common-hazard ODE (once refreshes exist) and
-the marginal-cohort prior (rho = 0.08, down from 0.22) when none do.
-Spread is horizon-dependent: the whole spread is scaled by 0.5 at a
-90-minute horizon rising to 0.8 at a 4.5-day horizon.
+playing (median tau_i hours, shared log-spread 0.4); tau_i is the
+GEOMETRIC MEAN of the last-point fit and the trajectory fit
+(fit_tau_traj, least squares over the whole refresh trajectory).  With a
+FLAT history (one refresh point) the median stays with the round-1
+models: the common-hazard ODE (once refreshes exist) and the
+marginal-cohort prior (rho = 0.08) when none do.  Spread is
+horizon-dependent: the whole spread is scaled by 0.5 at a 90-minute
+horizon rising to 0.7 at a 4.5-day horizon (round 3: 0.7, down from 0.8).
+
+## Round 3 changes (19 Nov 2026, evening) -- what changed and why
+
+Round 2 scored 0.147326 on the real practice cases (rank 326 of 3,588),
+typical miss 0.05 pp, coverage 0.9182.  The rank-20 cutoff is 0.0804, so
+round 3 needs a large move on practice -- but the diagnosis below says
+the practice median cannot be moved much further with the information
+available, and the real gain is on the final case (f00), which is what
+is scored officially.
+
+### Diagnosis: loss split (simulator)
+
+On the practice cases the loss sits in the middle quantiles (q25/q50/q75
+~0.16-0.32 vs tails ~0.07-0.10): the median is the lever, the spread is
+now well calibrated (real coverage 0.9182).  By trophy group the practice
+median bias is negative everywhere (-0.10 to -0.40 logit) and worst on
+FAST trophies (tau < 30 h).  On f00 the single biggest problem is the
+PLATINUM trophy: the delay median overpredicts it by +2.5 to +3.9 logit
+(12-50x) in every world -- one trophy contributing ~0.04 of the mean f00
+loss.  Decomposing the model's platinum forecast shows why: the fitted
+tau (~276 h vs a true 350 h) is nearly unidentified -- the observed
+count (~5) is ~the reviewer count at every refresh, so the fit lands
+wherever the tiny regular contribution matches -- and the far-tail
+earning (lag << tau) is exponentially sensitive to that tau, so the
+new-joiner and anchor cohorts contribute ~10x the true earner count.
+
+### The simulator itself was biased on practice (fixed for round 3)
+
+The round-2 simulator hardcoded REVIEWERS = 6, but the real anchor
+counts say the reviewer count is 5 (the mode of the small earner counts
+is 5, on 22 of 55 trophies).  In the simulator's world a trophy with a
+displayed count of 5 has 6 reviewers who earned it, so its true answer
+is ~6.2 earners while any model trusting the displayed count predicts
+~5 -- a systematic -0.2 logit bias on 33 of 55 trophies.  Rebuilding
+the worlds with REVIEWERS = 5 (the "consistent" simulator) drops the
+round-2 practice score from 0.1598/0.2016 to 0.1222/0.1469 and the mean
+from 0.2187 to 0.1859, while f00 barely moves (0.2946 -> 0.2884) --
+the f00 evaluation was never contaminated, the practice one was.  The
+real practice score (0.1473) now sits between the two simulator
+families, as it should.  All round-3 variant selection was done on BOTH
+simulator families plus two fresh-tau worlds.
+
+### What changed
+
+1. **Geometric-mean tau fit (multi-refresh histories).** tau_i =
+   sqrt(tau_last-point * tau_trajectory).  The trajectory fit alone
+   improves f00 (consistent sims 0.2884 -> 0.2514) but regresses the
+   saturating world (worst 0.3062 -> 0.3260, and 0.3547 on the original
+   sims -- the same regression round 2 found when it rejected the
+   trajectory fit).  The geometric mean keeps most of the gain
+   (consistent f00 0.2662 at K_LONG 0.8) while holding the worst world
+   at the round-2 level (0.3028).  It cuts the platinum bias on the
+   consistent sims (e.g. +3.95 -> +1.17 in one world, +2.51 -> +0.73 in
+   another) and improves the slow-trophy loss in every world.
+2. **K_SPREAD_LONG 0.8 -> 0.7.** A modest narrowing of the long-horizon
+   spread: f00 improves on every simulator family (consistent 0.2662 ->
+   0.2513, original 0.2874 -> 0.2731, fresh-tau 0.2956 -> 0.2601) with
+   practice untouched and the worst world unchanged.  The simulator
+   optimum is lower (~0.5-0.6) but that trusts the delay median more
+   than the real data warrants, so 0.7 is kept as the safety margin.
+3. **Rejected, with new evidence:** the delay+blend (f00 0.4244 --
+   the hazard median drags everything down on the long horizon);
+   the flat-history delay median (practice 0.50/0.54 on the CONSISTENT
+   simulator, coverage 0.58 -- the tau fit is unidentified when the
+   count is reviewer-dominated, and even the blend scores 0.27/0.28 vs
+   the marginal prior's 0.12/0.15); rho retuning (the sweep is a flat
+   plateau at 0.05-0.08 on the consistent sim, keep 0.08).
+
+### Simulator evaluation, round 3 (all three families)
+
+| model | practice p00/p01 | f00 | MEAN | worst world |
+|---|---|---|---|---|
+| round 2 (consistent sims, REV=5) | 0.1222 / 0.1469 | 0.2884 | 0.1859 | 0.3062 |
+| **round 3 (consistent sims, REV=5)** | **0.1216 / 0.1465** | **0.2513** | **0.1731** | **0.2973** |
+| round 2 (original sims, REV=6) | 0.1598 / 0.2016 | 0.2946 | 0.2187 | 0.3061 |
+| **round 3 (original sims, REV=6)** | **0.1594 / 0.2016** | **0.2731** | **0.2114** | **0.3108** |
+| round 2 (fresh-tau worlds simA/B) | 0.1644 / 0.2072 | 0.2956 | 0.2224 | 0.2959 |
+| **round 3 (fresh-tau worlds simA/B)** | **0.1641 / 0.2072** | **0.2601** | **0.2105** | **0.2606** |
+
+Coverage round 3: practice 0.94-0.95, f00 0.97 (consistent) / 0.89
+(original) -- the two families disagree on f00 coverage, which is why
+the spread was only narrowed to 0.7, not to the simulator optimum.
+
+Projected real practice score: ~unchanged from round 2 (0.1473) --
+the practice path is untouched by design, and the diagnosis says the
+practice median has no further lever with the information available
+(the flat delay is decisively rejected, rho is at its plateau, the
+spread is calibrated).  Round 3 is an f00 improvement: the simulator
+says ~0.25-0.27 on the final case vs 0.29 for round 2, with the worst
+world held -- but the simulator is self-built, the delay model is in
+its own class, and no local number predicts the real f00 score.  Honest
+assessment: round 3 is very likely to improve the final run
+materially; it is NOT likely to move the practice board toward the
+0.0804 cutoff (that would need a ~45% further cut in the practice
+loss, and there is no identified lever left for it).
 
 ## Round 2 changes (19 Nov 2026, evening) -- what changed and why
 
