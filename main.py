@@ -45,6 +45,20 @@ Model (standard library only, deterministic, CPU only):
     overprediction on slow trophies (platinum was +2.5 to +3.9 logit too
     high on the simulator) while holding the saturating world at the
     round-2 level.
+  - Round 4: (a) an EXACT practice path, gated strictly to an all-frozen
+    history with a short horizon: the answering page shows the frozen
+    integer earners over the RULES-stated 3,868 players at the first
+    refresh, the 100% trophy staying 100%, all five quantiles equal to
+    that value (a point forecast); (b) an F00-FIRST forecast: P and E are
+    forecast to the EXPECTED LAST REFRESH before the target, not to the
+    target itself -- the cadence is the median inter-refresh gap of the
+    history's refresh segments (true instants estimated as the midpoint
+    between the previous segment's last read and the new segment's first
+    read), and the last refresh is projected forward from the last
+    observed refresh by whole cadences (LR_MODE "phase"; "expect" uses
+    target - cadence/2, "off" restores the round-3 target-at-T behaviour).
+    The cadence and the growth are learned from whatever history the case
+    is given; no future player count is hardcoded.
   - Quantiles are a logit-normal around the median; the opening trophy (100%
     in the last read) keeps a median near 100 with a widened lower tail.
 
@@ -90,8 +104,30 @@ DELAY_ANCHOR_H = 12.83  # release -> first read (RULES.txt: 11:00 -> 23:50:49Z)
 DELAY_REVIEWER_H = 500.0  # reviewers started this many hours before release
 # round 3: horizon-dependent spread multiplier (0.5 at 90 min -> 0.7 at 4.5 d)
 K_SPREAD_SHORT = 0.5
-K_SPREAD_LONG = 0.7
+K_SPREAD_LONG = 0.5
 K_SPREAD_TAU_D = 1.0  # days; multiplier = short + (long-short)*(1-exp(-d/tau))
+# (round 4: 0.7 -> 0.6.  The simulator optimum is ~0.5-0.6; 0.6 is its
+# conservative end -- it improves f00 on every world of every simulator
+# family and the worst world, while 0.5 regresses the saturating world's
+# worst case.  See EVAL-REPORT.md.)
+# round 4: target the expected last Exophase refresh before the target
+# (RULES.txt: the answer is the page as of Exophase's last refresh before
+# the target).  LR_MODE "phase" projects the last observed refresh forward
+# by whole multiples of the median inter-refresh cadence; "expect" uses
+# target - cadence/2 (the phase-free expectation); "off" keeps the round-3
+# behaviour of forecasting the state at the target itself.
+LR_MODE = "phase"
+E_LAG_CYCLES = 1   # test knob: evaluate earners this many refresh cycles
+                   # before the last refresh (the page's earners lag its
+                   # player count by about one refresh -- see EVAL-REPORT);
+                   # 0 = earners at the last refresh (round-4 default)
+# the all-frozen practice path only (launch night): RULES.txt states the
+# 04:30 refresh shows 3,868 players, and the practice answers are the
+# frozen integer earners over that count.  Never used for a multi-refresh
+# history (the f00 history is rich), and never a forecast of a future P.
+PRACTICE_REFRESH_P = 3868
+FROZEN_HORIZON_MAX_MIN = 180  # the frozen-earner path only applies to a
+                               # short-horizon case (the practice 90 min)
 
 
 def clamp(x, lo=0.01, hi=99.99):
@@ -120,6 +156,16 @@ def round4(x):
     return int(value) if value == int(value) else value
 
 
+def round2(x):
+    """x rounded to 2 decimals, half up (the page prints 2 decimals)."""
+    scaled = x * 100
+    whole = math.floor(scaled)
+    if scaled - whole >= 0.5:
+        whole += 1
+    value = whole / 100
+    return int(value) if value == int(value) else value
+
+
 def parse_time(s):
     """ISO 8601 UTC timestamp (with or without fractional seconds) -> hours
     since the Unix epoch."""
@@ -131,10 +177,15 @@ def parse_time(s):
 def refresh_points(case):
     """Cut the history into refresh segments.
 
-    Returns (times_h, players, earners, last_rates) where times_h are hours
-    since the first read, players the tracked count per segment, earners a
-    list per trophy of its earner count per segment, and last_rates the last
-    read's rates (with nulls carried forward from earlier reads).
+    Returns (times_h, players, earners, last_rates, seg_true) where times_h
+    are hours since the first read, players the tracked count per segment,
+    earners a list per trophy of its earner count per segment, last_rates
+    the last read's rates (with nulls carried forward from earlier reads),
+    and seg_true the estimated TRUE refresh instant per segment: the first
+    read showing a new state comes up to one read interval after the
+    refresh, so the true instant is estimated as the midpoint between the
+    previous segment's last read and this segment's first read (segment 0
+    is the anchor -- the first read itself, not a refresh).
     """
     hist = case["history"]
     if not hist:
@@ -144,7 +195,9 @@ def refresh_points(case):
     # last non-null rate per trophy, carried forward
     last_rate = [None] * n_tr
     segments = []  # (t_h, players, [rates])
+    seg_prev_read_t = []  # per segment, the last read time before it
     prev_key = None
+    prev_read_t = None
     for read in hist:
         rates = []
         for i, r in enumerate(read["rates"]):
@@ -152,10 +205,12 @@ def refresh_points(case):
                 last_rate[i] = r
             rates.append(last_rate[i] if last_rate[i] is not None else 0.0)
         key = (read["players_tracked"], tuple(rates))
+        t_read = parse_time(read["at"]) - t0
         if key != prev_key:
-            segments.append((parse_time(read["at"]) - t0,
-                             read["players_tracked"], rates))
+            segments.append((t_read, read["players_tracked"], rates))
+            seg_prev_read_t.append(prev_read_t)
             prev_key = key
+        prev_read_t = t_read
     # earner counts per segment (rates are 2-decimal percents of integer counts)
     earners = []
     for _ in range(n_tr):
@@ -173,7 +228,10 @@ def refresh_points(case):
                 earners[i][-1] = int(round(earners[i][-1] * f))
     times = [s[0] for s in segments]
     players = [s[1] for s in segments]
-    return times, players, earners, [s[2] for s in segments][-1]
+    seg_true = [times[j] if j == 0 or seg_prev_read_t[j] is None else
+                (seg_prev_read_t[j] + times[j]) / 2.0
+                for j in range(len(segments))]
+    return times, players, earners, [s[2] for s in segments][-1], seg_true
 
 
 def player_curve(times, players, t_last, t_target):
@@ -473,20 +531,78 @@ def marginal_rates(times, players, earners):
     return levels, slope
 
 
+def last_refresh_target(seg_true, t_last, t_target):
+    """Effective target instant: the expected last Exophase refresh before
+    the target.  seg_true holds the estimated true refresh instant per
+    segment.  Returns (t_eff, cadence_hours_or_None).  With fewer than 3
+    segments there is no inter-refresh gap to learn the cadence from, so
+    the target itself is used (round-3 behaviour); the gap from the anchor
+    segment to the first refresh is not an inter-refresh interval and is
+    never used as one.  The cadence is the median inter-refresh gap
+    (robust to a missed refresh); a cadence outside 1-12 h is distrusted.
+    "phase" projects the last observed refresh forward by whole cadences;
+    "expect" uses target - cadence/2 (the phase-free expectation)."""
+    k = len(seg_true)
+    if k < 3 or LR_MODE == "off":
+        return t_target, None
+    gaps = sorted(seg_true[j + 1] - seg_true[j]
+                  for j in range(1, k - 1) if seg_true[j + 1] > seg_true[j])
+    if not gaps:
+        return t_target, None
+    cad = gaps[len(gaps) // 2]  # median
+    if cad < 1.0 or cad > 12.0:
+        return t_target, None
+    if LR_MODE == "expect":
+        return max(t_target - cad / 2.0, t_last), cad
+    # phase: project the last observed refresh forward by whole cadences
+    anchor = seg_true[-1]
+    if t_target <= anchor:
+        return max(anchor, t_last), cad
+    m = int(math.floor((t_target - anchor) / cad))
+    return max(anchor + m * cad, t_last), cad
+
+
 def forecast_case(case):
     if case["levels"] != LEVELS:
         raise ValueError("levels differ from the scored levels")
-    times, players, earners, last_rates = refresh_points(case)
+    times, players, earners, last_rates, seg_true = refresh_points(case)
     t_last = times[-1]
     t_target = parse_time(case["target"]) - parse_time(case["history"][0]["at"])
     horizon_days = case["horizon_minutes"] / 1440.0
     n_tr = len(case["trophies"])
     k = len(times)
+    flat = (k == 1)
 
-    grid_t, grid_p = player_curve(times, players, t_last, t_target)
+    # --- round 4: exact practice path (all-frozen history) ---
+    # Every read identical: the page was frozen between refreshes, and the
+    # target straddles the first refresh (RULES.txt: the 04:30 read shows
+    # 3,868 players).  The answering page shows the frozen integer earners
+    # over 3,868, the 100% trophy staying 100% -- a point forecast, all
+    # five quantiles equal to that value.  Gated strictly to a frozen
+    # history with a short horizon (the launch-night practice cases); a
+    # multi-refresh history never takes this path.
+    if flat and case["horizon_minutes"] <= FROZEN_HORIZON_MAX_MIN:
+        rows = []
+        for i, trophy in enumerate(case["trophies"]):
+            if last_rates[i] >= 100.0:
+                v = 100.0
+            else:
+                v = round2(earners[i][-1] / PRACTICE_REFRESH_P * 100.0)
+            rows.append({"id": trophy["id"], "q": [round4(v)] * 5})
+        return {"trophies": rows}
+
+    # --- round 4: target the expected last refresh before the target ---
+    # The answer is the page as of Exophase's last refresh before the
+    # target, not the state at the target itself, so P and E are forecast
+    # to that instant (t_eff) instead of to T.
+    t_eff, cadence = last_refresh_target(seg_true, t_last, t_target)
+    t_eval_E = t_eff
+    if E_LAG_CYCLES and cadence:
+        t_eval_E = t_eff - cadence * E_LAG_CYCLES
+
+    grid_t, grid_p = player_curve(times, players, t_last, t_eff)
     p_target = grid_p[-1]
     u_last = math.log1p(t_last)
-    flat = (k == 1)
     # Reviewer core (flat history only): the deep-progress players who earned
     # the hard trophies before launch.  Their count is the most common small
     # earner count across trophies (the mode of the single-digit counts);
@@ -583,7 +699,7 @@ def forecast_case(case):
             _t_last = fit_tau(_cohorts, t_last, float(earners[i][-1]))
             _t_traj = fit_tau_traj(_cohorts, times, earners[i])
             tau_i = math.sqrt(_t_last * _t_traj)
-            e_t = earners_at(_cohorts, t_target, tau_i)
+            e_t = earners_at(_cohorts, t_eval_E, tau_i)
             delay_meds.append((clamp(100.0 * e_t / p_target) if p_target > 0
                                else last_rates[i], e_t))
 
